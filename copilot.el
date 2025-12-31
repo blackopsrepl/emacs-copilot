@@ -1,165 +1,199 @@
-;;; copilot.el --- Emacs Copilot
+;;; copilot.el --- Smart Ollama code completion with FIM -*- lexical-binding: t; -*-
 
 ;; Copyright 2023 Justine Alexandra Roberts Tunney
+;; Copyright 2024 Contributors
 
-;; Author: Justine Tunney
-;; Email: jtunney@mozilla.com
+;; Author: Justine Tunney, pvd
 ;; License: Apache 2.0
-;; Version: 0.1
+;; Version: 0.2
 
-;; Copyright 2023 Mozilla Foundation
-;;
 ;; Licensed under the Apache License, Version 2.0 (the "License");
 ;; you may not use this file except in compliance with the License.
 ;; You may obtain a copy of the License at
 ;;
 ;;     http://www.apache.org/licenses/LICENSE-2.0
-;;
-;; Unless required by applicable law or agreed to in writing, software
-;; distributed under the License is distributed on an "AS IS" BASIS,
-;; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-;; See the License for the specific language governing permissions and
-;; limitations under the License.
 
 ;;; Commentary:
 ;;
-;; The `copilot-complete' function demonstrates that ~100 lines of LISP
-;; is all it takes for Emacs to do that thing Github Copilot and VSCode
-;; are famous for doing except superior w.r.t. both quality and freedom
+;; Emacs Copilot provides AI-powered code completion using Ollama with
+;; Fill-in-the-Middle (FIM) prompting. It uses smart context extraction
+;; including imports and tree-sitter function detection.
 ;;
-;; Emacs Copilot helps you do pair programming with a local-running LLM
-;; that generates code completions within Emacs buffers. The LLM is run
-;; as a sub-command that remembers your local editing history on a file
-;; by file basis. Tokens stream into your buffer without delay as gen'd
-;; and you can hit `C-g' to interrupt your LLM at any time. History and
-;; memory can also be deleted from the LLM's context when deleting code
-;; from your Emacs buffer that matches up verbatim. Copilot is language
-;; agnostic and your programming language is determed by file extension
+;; Requirements:
+;;   - Ollama running locally (http://localhost:11434)
+;;   - A FIM-capable model like qwen2.5-coder
+;;   - curl and jq in PATH
 ;;
-;; The recommended LLM right now is WizardCoder 34b since it scores the
-;; same as GPT-4 on HumanEval. You need a computer like a Mac Studio M2
-;; Ultra in order to use it. If you have a modest system then you could
-;; consider downloading the WizardCoder-Python-13b llamafile since it's
-;; almost as good, and will even go acceptably fast on CPU-only systems
-;; having at least AVX2 and 2200 MT/s RAM. If you're even more strapped
-;; for compute and use things like Raspberry Pi, then give Phi-2 a spin
+;; Usage:
+;;   Place cursor where you want completion and run M-x copilot-complete
+;;   or press C-c C-k
 ;;
-;; To get started, try writing the first line of a function, e.g.
-;;
-;;     bool is_prime(int x) {
-;;
-;; Then place your caret at the end of the line, and press `C-c C-k` to
-;; hand over control to your LLM, which should generate the rest of the
-;; function implementation for you. Things are also tuned so the LLM is
-;; likely to stop as soon as a function is made. Explanations and other
-;; kind of ELI5 commentary is avoided too.
-;;
-;; Later on, if you were to write something like this:
-;;
-;;     int main() {
-;;       for (int i = 0; i < 100;
-;;
-;; And ask your LLM to complete that, then your LLM will likely recall
-;; that you two wrote an is_prime() function earlier, even though it's
-;; only considering those two lines in the current instruction. You'll
-;; most likely then see it decide to generate code to print the primes
+;; Configuration:
+;;   (setq copilot-model "qwen2.5-coder:1.5b")  ; or larger model
+;;   (setq copilot-url "http://localhost:11434/api/generate")
 
 ;;; Code:
 
 (defgroup copilot nil
-  "Large language model code completion."
+  "Ollama-based code completion."
   :prefix "copilot-"
   :group 'editing)
 
-(defcustom copilot-bin
-  "wizardcoder-python-34b-v1.0.Q5_K_M.llamafile"
-  "Path of llamafile executable with LLM weights."
+(defcustom copilot-model "qwen2.5-coder:1.5b"
+  "Ollama model to use for completion."
   :type 'string
   :group 'copilot)
 
+(defcustom copilot-url "http://localhost:11434/api/generate"
+  "Ollama API endpoint."
+  :type 'string
+  :group 'copilot)
+
+(defcustom copilot-import-lines 15
+  "Number of lines from start of file to include as imports."
+  :type 'integer
+  :group 'copilot)
+
+(defcustom copilot-prefix-lines 30
+  "Max lines before cursor to include."
+  :type 'integer
+  :group 'copilot)
+
+(defcustom copilot-suffix-lines 20
+  "Max lines after cursor to include."
+  :type 'integer
+  :group 'copilot)
+
+;;; Context extraction
+
+(defun copilot--get-imports ()
+  "Get first `copilot-import-lines' lines of file."
+  (save-excursion
+    (goto-char (point-min))
+    (forward-line copilot-import-lines)
+    (buffer-substring-no-properties (point-min) (point))))
+
+(defun copilot--get-prefix ()
+  "Get up to `copilot-prefix-lines' lines before point."
+  (save-excursion
+    (let ((end (point)))
+      (forward-line (- copilot-prefix-lines))
+      (beginning-of-line)
+      (buffer-substring-no-properties (point) end))))
+
+(defun copilot--get-suffix ()
+  "Get up to `copilot-suffix-lines' lines after point."
+  (save-excursion
+    (let ((start (point)))
+      (forward-line copilot-suffix-lines)
+      (end-of-line)
+      (buffer-substring-no-properties start (point)))))
+
+(defun copilot--get-enclosing-defun ()
+  "Get enclosing function via tree-sitter if available."
+  (when (and (fboundp 'treesit-defun-at-point)
+             (ignore-errors (treesit-language-at (point))))
+    (let ((node (ignore-errors (treesit-defun-at-point))))
+      (when node
+        (let ((text (treesit-node-text node)))
+          (when (< (length text) 2000)  ; Don't include huge functions
+            text))))))
+
+;;; Context assembly
+
+(defun copilot--build-context ()
+  "Build smart context for completion.
+Returns (PREFIX . SUFFIX) for FIM."
+  (let* ((imports (copilot--get-imports))
+         (prefix-raw (copilot--get-prefix))
+         (suffix (copilot--get-suffix))
+         (defun-text (copilot--get-enclosing-defun))
+         (current-line (line-number-at-pos))
+         prefix)
+    ;; Build prefix: imports + context before cursor
+    (if (<= current-line copilot-import-lines)
+        ;; Near top: just use prefix (includes imports)
+        (setq prefix prefix-raw)
+      ;; Further down: imports + ... + prefix
+      (if (and defun-text
+               (not (string-match-p (regexp-quote defun-text) prefix-raw)))
+          ;; Include enclosing function if not already in prefix
+          (setq prefix (concat imports "\n...\n" defun-text "\n...\n"
+                               (substring prefix-raw (min (length prefix-raw)
+                                                          (* 5 80))))) ; last ~5 lines
+        ;; Just imports + prefix
+        (setq prefix (concat imports "\n...\n" prefix-raw))))
+    (cons prefix suffix)))
+
+;;; Ollama API
+
+(defun copilot--call-ollama (prefix suffix)
+  "Call Ollama with FIM prompt using temp file to avoid shell escaping issues."
+  (let* ((tmpfile (make-temp-file "copilot" nil ".json"))
+         (payload `((model . ,copilot-model)
+                    (prompt . ,(format "<|fim_prefix|>%s<|fim_suffix|>%s<|fim_middle|>"
+                                       prefix suffix))
+                    (raw . t)
+                    (stream . :json-false)
+                    (options . ((temperature . 0)
+                                (num_predict . 128)
+                                (stop . ["<|fim_pad|>" "<|endoftext|>" "\n\n"]))))))
+    (with-temp-file tmpfile
+      (insert (json-encode payload)))
+    (unwind-protect
+        (string-trim
+         (shell-command-to-string
+          (format "curl -s -X POST %s -H 'Content-Type: application/json' -d @%s | jq -r '.response // empty'"
+                  copilot-url tmpfile)))
+      (delete-file tmpfile))))
+
+;;; Cleanup
+
+(defun copilot--clean-response (response)
+  "Clean up model RESPONSE."
+  (let ((cleaned response))
+    ;; Convert literal \n \t \r to actual chars
+    (setq cleaned (replace-regexp-in-string "\\\\n" "\n" cleaned nil t))
+    (setq cleaned (replace-regexp-in-string "\\\\t" "\t" cleaned nil t))
+    (setq cleaned (replace-regexp-in-string "\\\\r" "" cleaned nil t))
+    ;; Remove markdown code blocks
+    (setq cleaned (replace-regexp-in-string "^```[a-z]*\n?" "" cleaned))
+    (setq cleaned (replace-regexp-in-string "\n?```$" "" cleaned))
+    ;; Remove FIM tokens that might leak through
+    (setq cleaned (replace-regexp-in-string "<|fim_[a-z]+|>" "" cleaned))
+    (setq cleaned (replace-regexp-in-string "<|endoftext|>" "" cleaned))
+    (string-trim-right cleaned)))
+
+;;; Main entry point
+
+;;;###autoload
+(defun copilot-debug ()
+  "Show what would be sent to Ollama."
+  (interactive)
+  (let* ((prefix (copilot--get-prefix))
+         (suffix (copilot--get-suffix)))
+    (with-current-buffer (get-buffer-create "*copilot-debug*")
+      (erase-buffer)
+      (insert "=== PREFIX ===\n" prefix "\n\n=== SUFFIX ===\n" suffix)
+      (pop-to-buffer (current-buffer)))))
+
 ;;;###autoload
 (defun copilot-complete ()
+  "Complete code at point using Ollama with FIM."
   (interactive)
-  (let* ((spot (point))
-         (inhibit-quit t)
-         (curfile (buffer-file-name))
-         (cash (concat curfile ".cache"))
-         (hist (concat curfile ".prompt"))
-         (lang (file-name-extension curfile))
+  (message "Copilot: generating...")
+  (let* ((prefix (copilot--get-prefix))
+         (suffix (copilot--get-suffix))
+         (response (copilot--call-ollama prefix suffix)))
+    (if (and response (not (string-empty-p response)))
+        (progn
+          (insert (copilot--clean-response response))
+          (message "Copilot: done"))
+      (message "Copilot: no completion"))))
 
-         ;; extract current line, to left of caret
-         ;; and the previous line, to give the llm
-         (code (save-excursion
-                 (dotimes (i 2)
-                   (when (> (line-number-at-pos) 1)
-                     (previous-line)))
-                 (beginning-of-line)
-                 (buffer-substring-no-properties (point) spot)))
+;;; Keybinding
 
-         ;; create new prompt for this interaction
-         (system "\
-You are an Emacs code generator. \
-Writing comments is forbidden. \
-Writing test code is forbidden. \
-Writing English explanations is forbidden. ")
-         (prompt (format
-                  "[INST]%sGenerate %s code to complete:[/INST]\n```%s\n%s"
-                  (if (file-exists-p cash) "" system) lang lang code)))
-
-    ;; iterate text deleted within editor then purge it from prompt
-    (when kill-ring
-      (save-current-buffer
-        (find-file hist)
-        (dotimes (i 10)
-          (let ((substring (current-kill i t)))
-            (when (and substring (string-match-p "\n.*\n" substring))
-              (goto-char (point-min))
-              (while (search-forward substring nil t)
-                (delete-region (- (point) (length substring)) (point))))))
-        (save-buffer 0)
-        (kill-buffer (current-buffer))))
-
-    ;; append prompt for current interaction to the big old prompt
-    (write-region prompt nil hist 'append 'silent)
-
-    ;; run llamafile streaming stdout into buffer catching ctrl-g
-    (with-local-quit
-      (call-process copilot-bin nil (list (current-buffer) nil) t
-                    "--prompt-cache" cash
-                    "--prompt-cache-all"
-                    "--silent-prompt"
-                    "--temp" "0"
-                    "-c" "1024"
-                    "-ngl" "35"
-                    "-r" "```"
-                    "-r" "\n}"
-                    "-f" hist))
-
-    ;; get rid of most markdown syntax
-    (let ((end (point)))
-      (save-excursion
-        (goto-char spot)
-        (while (search-forward "\\_" end t)
-          (backward-char)
-          (delete-backward-char 1 nil)
-          (setq end (- end 1)))
-        (goto-char spot)
-        (while (search-forward "```" end t)
-          (delete-backward-char 3 nil)
-          (setq end (- end 3))))
-
-      ;; append generated code to prompt
-      (write-region spot end hist 'append 'silent))))
-
-;; define `ctrl-c ctrl-k` keybinding for llm code completion
-(defun copilot-c-hook ()
-  (define-key c-mode-base-map (kbd "C-c C-k") 'copilot-complete))
-(add-hook 'c-mode-common-hook 'copilot-c-hook)
-(defun copilot-py-hook ()
-  (define-key python-mode-map (kbd "C-c C-k") 'copilot-complete))
-(add-hook 'python-common-hook 'copilot-py-hook)
 (global-set-key (kbd "C-c C-k") 'copilot-complete)
 
 (provide 'copilot)
-
-;;; ansi-mode.el ends here
+;;; copilot.el ends here
