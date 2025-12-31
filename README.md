@@ -87,7 +87,7 @@ If you don't have Emacs installed:
 ## Credits
 
 Original implementation by [Justine Tunney](https://github.com/jart) using llamafile.
-Ollama + FIM rewrite by pvd.
+Ollama + FIM rewrite by Vittorio Distefano.
 
 ## License
 
